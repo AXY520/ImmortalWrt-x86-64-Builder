@@ -3,25 +3,45 @@
 # Log file for debugging
 LOGFILE="/etc/config/uci-defaults-log.txt"
 echo "Starting 99-custom.sh at $(date)" >>$LOGFILE
-# 设置默认防火墙规则，方便单网口虚拟机首次访问 WebUI 
-# 因为本项目中 单网口模式是dhcp模式 直接就能上网并且访问web界面 避免新手每次都要修改/etc/config/network中的静态ip
-# 当你刷机运行后 都调整好了 你完全可以在web页面自行关闭 wan口防火墙的入站数据
-# 具体操作方法：网络——防火墙 在wan的入站数据 下拉选项里选择 拒绝 保存并应用即可。
-uci set firewall.@zone[1].input='ACCEPT'
+
+read_setting() {
+    setting_file="$1"
+    default_value="$2"
+    if [ -f "$setting_file" ]; then
+        cat "$setting_file"
+    else
+        printf '%s' "$default_value"
+    fi
+}
+
+PPPOE_ENABLED_FILE="/etc/config/pppoe-enabled"
+PPPOE_ACCOUNT_FILE="/etc/config/pppoe-account"
+PPPOE_PASSWORD_FILE="/etc/config/pppoe-password"
+ALLOW_WAN_ADMIN_FILE="/etc/config/allow-wan-admin"
+
+enable_pppoe="$(read_setting "$PPPOE_ENABLED_FILE" "no")"
+pppoe_account="$(read_setting "$PPPOE_ACCOUNT_FILE" "")"
+pppoe_password="$(read_setting "$PPPOE_PASSWORD_FILE" "")"
+allow_wan_admin="$(read_setting "$ALLOW_WAN_ADMIN_FILE" "no")"
+
+# 默认拒绝从 WAN 访问管理服务。只有构建时显式选择后才放开。
+wan_input="REJECT"
+if [ "$allow_wan_admin" = "yes" ]; then
+    wan_input="ACCEPT"
+fi
+
+wan_zone="$(uci show firewall | sed -n "s/^\(firewall\.[^.]*\)\.name='wan'$/\1/p" | head -n 1)"
+if [ -n "$wan_zone" ]; then
+    uci set "${wan_zone}.input=${wan_input}"
+    echo "WAN input policy: $wan_input" >>$LOGFILE
+else
+    echo "Cannot find WAN firewall zone." >>$LOGFILE
+fi
 
 # 设置主机名映射，解决安卓原生 TV 无法联网的问题
 uci add dhcp domain
 uci set "dhcp.@domain[-1].name=time.android.com"
 uci set "dhcp.@domain[-1].ip=203.107.6.88"
-
-# 检查配置文件pppoe-settings是否存在 该文件由build.sh动态生成
-SETTINGS_FILE="/etc/config/pppoe-settings"
-if [ ! -f "$SETTINGS_FILE" ]; then
-    echo "PPPoE settings file not found. Skipping." >>$LOGFILE
-else
-    # 读取pppoe信息($enable_pppoe、$pppoe_account、$pppoe_password)
-    . "$SETTINGS_FILE"
-fi
 
 # 1. 先获取所有物理接口列表
 ifnames=""
@@ -37,26 +57,10 @@ count=$(echo "$ifnames" | wc -w)
 echo "Detected physical interfaces: $ifnames" >>$LOGFILE
 echo "Interface count: $count" >>$LOGFILE
 
-# 2. 根据板子型号映射WAN和LAN接口
-board_name=$(cat /tmp/sysinfo/board_name 2>/dev/null || echo "unknown")
-echo "Board detected: $board_name" >>$LOGFILE
-
-wan_ifname=""
-lan_ifnames=""
-# 此处特殊处理个别开发板网口顺序问题
-case "$board_name" in
-    "radxa,e20c"|"friendlyarm,nanopi-r5c")
-        wan_ifname="eth1"
-        lan_ifnames="eth0"
-        echo "Using $board_name mapping: WAN=$wan_ifname LAN=$lan_ifnames" >>"$LOGFILE"
-        ;;
-    *)
-        # 默认第一个接口为WAN，其余为LAN
-        wan_ifname=$(echo "$ifnames" | awk '{print $1}')
-        lan_ifnames=$(echo "$ifnames" | cut -d ' ' -f2-)
-        echo "Using default mapping: WAN=$wan_ifname LAN=$lan_ifnames" >>"$LOGFILE"
-        ;;
-esac
+# 2. x86_64 默认使用第一个物理接口作为 WAN，其余接口作为 LAN。
+wan_ifname=$(echo "$ifnames" | awk '{print $1}')
+lan_ifnames=$(echo "$ifnames" | cut -d ' ' -f2-)
+echo "Using x86 mapping: WAN=$wan_ifname LAN=$lan_ifnames" >>"$LOGFILE"
 
 # 3. 配置网络
 if [ "$count" -eq 1 ]; then
@@ -80,7 +84,7 @@ elif [ "$count" -gt 1 ]; then
     uci set network.wan6.proto='dhcpv6'
 
     # 查找 br-lan 设备 section
-    section=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
+    section=$(uci show network | awk -F '[.=]' '/\.@?device\[[0-9]+\]\.name=.br-lan.$/ {print $2; exit}')
     if [ -z "$section" ]; then
         echo "error：cannot find device 'br-lan'." >>$LOGFILE
     else
@@ -102,8 +106,8 @@ elif [ "$count" -gt 1 ]; then
     if [ -f "$IP_VALUE_FILE" ]; then
         CUSTOM_IP=$(cat "$IP_VALUE_FILE")
         # 用户在UI上设置的路由器后台管理地址
-        uci set network.lan.ipaddr=$CUSTOM_IP
-        echo "custom router ip is $CUSTOM_IP" >> $LOGFILE
+        uci set network.lan.ipaddr="$CUSTOM_IP"
+        echo "custom router ip is $CUSTOM_IP" >>$LOGFILE
     else
         uci set network.lan.ipaddr='192.168.100.1'
         echo "default router ip is 192.168.100.1" >> $LOGFILE
@@ -127,8 +131,11 @@ elif [ "$count" -gt 1 ]; then
     uci commit network
 fi
 
+# PPPoE 凭据已经写入 UCI，删除固件中的临时副本。
+rm -f "$PPPOE_ENABLED_FILE" "$PPPOE_ACCOUNT_FILE" "$PPPOE_PASSWORD_FILE" "$ALLOW_WAN_ADMIN_FILE"
+
 # 设置所有网口可访问网页终端
-uci delete ttyd.@ttyd[0].interface
+uci -q delete ttyd.@ttyd[0].interface
 
 # 设置所有网口可连接 SSH
 uci set dropbear.@dropbear[0].Interface=''
@@ -136,7 +143,7 @@ uci commit
 
 # 设置编译作者信息
 FILE_PATH="/etc/openwrt_release"
-NEW_DESCRIPTION="Packaged by wukongdaily"
+NEW_DESCRIPTION="Custom x86-64 ImmortalWrt"
 sed -i "s/DISTRIB_DESCRIPTION='[^']*'/DISTRIB_DESCRIPTION='$NEW_DESCRIPTION'/" "$FILE_PATH"
 
 # 若luci-app-advancedplus (进阶设置)已安装 则去除zsh的调用 防止命令行报 /usb/bin/zsh: not found的提示

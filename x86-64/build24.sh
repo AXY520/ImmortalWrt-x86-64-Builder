@@ -1,25 +1,29 @@
 #!/bin/bash
-# Log file for debugging
+set -Eeuo pipefail
+
+CUSTOM_PACKAGES=""
 source shell/custom-packages.sh
 source shell/switch_repository.sh
 echo "第三方软件包: $CUSTOM_PACKAGES"
-LOGFILE="/tmp/uci-defaults-log.txt"
-echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
+
+: "${PROFILE:?PROFILE is required}"
+: "${INCLUDE_DOCKER:=yes}"
+: "${ENABLE_PPPOE:=yes}"
+: "${PPPOE_ACCOUNT:=}"
+: "${PPPOE_PASSWORD:=}"
+: "${ALLOW_WAN_ADMIN:=no}"
+
 echo "编译固件大小为: $PROFILE MB"
 echo "Include Docker: $INCLUDE_DOCKER"
 
-echo "Create pppoe-settings"
-mkdir -p  /home/build/immortalwrt/files/etc/config
-
-# 创建pppoe配置文件 yml传入环境变量ENABLE_PPPOE等 写入配置文件 供99-custom.sh读取
-cat << EOF > /home/build/immortalwrt/files/etc/config/pppoe-settings
-enable_pppoe=${ENABLE_PPPOE}
-pppoe_account=${PPPOE_ACCOUNT}
-pppoe_password=${PPPOE_PASSWORD}
-EOF
-
-echo "cat pppoe-settings"
-cat /home/build/immortalwrt/files/etc/config/pppoe-settings
+# 将网络参数写入独立文件，避免把用户输入当作 shell 代码执行。
+SETTINGS_DIR="/home/build/immortalwrt/files/etc/config"
+install -d -m 700 "$SETTINGS_DIR"
+umask 077
+printf '%s' "$ENABLE_PPPOE" > "$SETTINGS_DIR/pppoe-enabled"
+printf '%s' "$PPPOE_ACCOUNT" > "$SETTINGS_DIR/pppoe-account"
+printf '%s' "$PPPOE_PASSWORD" > "$SETTINGS_DIR/pppoe-password"
+printf '%s' "$ALLOW_WAN_ADMIN" > "$SETTINGS_DIR/allow-wan-admin"
 
 if [ -z "$CUSTOM_PACKAGES" ]; then
   echo "⚪️ 未选择 任何第三方软件包"
@@ -76,7 +80,7 @@ if echo "$PACKAGES" | grep -q "luci-app-openclash"; then
     mkdir -p files/etc/openclash/core
     # Download clash_meta
     META_URL="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-amd64-v1.tar.gz"
-    wget -qO- $META_URL | tar xOvz > files/etc/openclash/core/clash_meta
+    wget -qO- "$META_URL" | tar xOvz > files/etc/openclash/core/clash_meta
     chmod +x files/etc/openclash/core/clash_meta
     # Download GeoIP and GeoSite
     wget -q https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -O files/etc/openclash/GeoIP.dat
@@ -109,9 +113,7 @@ fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Building image with the following packages:"
 echo "$PACKAGES"
 
-make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE=$PROFILE
-
-if [ $? -ne 0 ]; then
+if ! make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="/home/build/immortalwrt/files" ROOTFS_PARTSIZE="$PROFILE"; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Build failed!"
     exit 1
 fi

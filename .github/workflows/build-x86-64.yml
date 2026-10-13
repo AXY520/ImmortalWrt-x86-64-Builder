@@ -1,0 +1,296 @@
+name: Build x86-64 ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_version:
+        description: ImmortalWrt 版本
+        required: true
+        default: "25.12.2"
+        type: choice
+        options:
+          - "25.12.2"
+          - "25.12.1"
+          - "25.12.0"
+          - "24.10.6"
+          - "24.10.5"
+          - "24.10.4"
+          - "24.10.3"
+          - "24.10.2"
+          - "24.10.1"
+          - "24.10.0"
+      output_type:
+        description: 构建产物
+        required: true
+        default: img
+        type: choice
+        options:
+          - img
+          - img+iso
+      rootfs_size:
+        description: 软件包空间大小
+        required: true
+        default: 1G
+        type: choice
+        options:
+          - 1G
+          - 2G
+          - 3G
+          - 4G
+      custom_router_ip:
+        description: LAN 管理地址
+        required: true
+        default: 192.168.100.1
+        type: string
+      include_docker:
+        description: 集成 Docker
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+      enable_store:
+        description: 集成 iStore 商店
+        required: false
+        default: false
+        type: boolean
+      enable_pppoe:
+        description: 启用 PPPoE；账号密码从 GitHub Secrets 读取
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+      allow_wan_admin:
+        description: 允许从 WAN 访问路由器管理服务
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/build-x86-64.yml"
+      - "files/**"
+      - "shell/**"
+      - "x86-64/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: x86-64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build_firmware:
+    runs-on: ubuntu-22.04
+    outputs:
+      output_type: ${{ steps.configure.outputs.output_type }}
+    env:
+      FIRMWARE_VERSION: ${{ inputs.firmware_version || '25.12.2' }}
+      OUTPUT_TYPE: ${{ inputs.output_type || 'img' }}
+      ROOTFS_SIZE_CHOICE: ${{ inputs.rootfs_size || '1G' }}
+      CUSTOM_ROUTER_IP: ${{ inputs.custom_router_ip || '192.168.100.1' }}
+      INCLUDE_DOCKER: ${{ inputs.include_docker || 'yes' }}
+      ENABLE_STORE: ${{ inputs.enable_store || 'false' }}
+      ENABLE_PPPOE: ${{ inputs.enable_pppoe || 'yes' }}
+      ALLOW_WAN_ADMIN: ${{ inputs.allow_wan_admin || 'no' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure build
+        id: configure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$FIRMWARE_VERSION" in
+            24.10.*)
+              build_script="x86-64/build24.sh"
+              build_config="x86-64/imm.config"
+              custom_packages_file="shell/custom-packages.sh"
+              ;;
+            25.12.*)
+              build_script="x86-64/build25.sh"
+              build_config="x86-64/imm25.config"
+              custom_packages_file="shell/apk-custom-packages.sh"
+              ;;
+            *)
+              echo "Unsupported firmware version: $FIRMWARE_VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$ROOTFS_SIZE_CHOICE" in
+            1G) rootfs_partsize=1024 ;;
+            2G) rootfs_partsize=2048 ;;
+            3G) rootfs_partsize=3072 ;;
+            4G) rootfs_partsize=4096 ;;
+            *)
+              echo "Unsupported rootfs size: $ROOTFS_SIZE_CHOICE" >&2
+              exit 1
+              ;;
+          esac
+
+          python3 - <<'PY'
+          import ipaddress
+          import os
+
+          ipaddress.IPv4Address(os.environ["CUSTOM_ROUTER_IP"])
+          PY
+
+          {
+            echo "BUILD_SCRIPT=$build_script"
+            echo "BUILD_CONFIG=$build_config"
+            echo "CUSTOM_PACKAGES_FILE=$custom_packages_file"
+            echo "ROOTFS_PARTSIZE=$rootfs_partsize"
+          } >> "$GITHUB_ENV"
+
+          echo "output_type=$OUTPUT_TYPE" >> "$GITHUB_OUTPUT"
+
+      - name: Validate PPPoE secrets
+        if: env.ENABLE_PPPOE == 'yes'
+        env:
+          PPPOE_ACCOUNT: ${{ secrets.PPPOE_ACCOUNT }}
+          PPPOE_PASSWORD: ${{ secrets.PPPOE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$PPPOE_ACCOUNT" ] || [ -z "$PPPOE_PASSWORD" ]; then
+            echo "PPPoE is enabled, but PPPOE_ACCOUNT or PPPOE_PASSWORD is missing." >&2
+            echo "Add both values in Settings > Secrets and variables > Actions." >&2
+            exit 1
+          fi
+
+      - name: Prepare firmware overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 custom
+          printf '%s\n' "$CUSTOM_ROUTER_IP" > custom/custom_router_ip.txt
+          chmod 600 custom/custom_router_ip.txt
+
+      - name: Enable iStore
+        if: env.ENABLE_STORE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-store"' >> "$CUSTOM_PACKAGES_FILE"
+
+      - name: Build firmware
+        env:
+          PPPOE_ACCOUNT: ${{ secrets.PPPOE_ACCOUNT }}
+          PPPOE_PASSWORD: ${{ secrets.PPPOE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i \
+            --user root \
+            -v "${GITHUB_WORKSPACE}/bin:/home/build/immortalwrt/bin" \
+            -v "${GITHUB_WORKSPACE}/files:/home/build/immortalwrt/files" \
+            -v "${GITHUB_WORKSPACE}/custom:/home/build/immortalwrt/files/etc/config" \
+            -v "${GITHUB_WORKSPACE}/${BUILD_CONFIG}:/home/build/immortalwrt/.config" \
+            -v "${GITHUB_WORKSPACE}/shell:/home/build/immortalwrt/shell" \
+            -v "${GITHUB_WORKSPACE}/${BUILD_SCRIPT}:/home/build/immortalwrt/build.sh" \
+            -e PROFILE="$ROOTFS_PARTSIZE" \
+            -e INCLUDE_DOCKER \
+            -e ENABLE_PPPOE \
+            -e PPPOE_ACCOUNT \
+            -e PPPOE_PASSWORD \
+            -e ALLOW_WAN_ADMIN \
+            "immortalwrt/imagebuilder:x86-64-openwrt-${FIRMWARE_VERSION}" \
+            /bin/bash /home/build/immortalwrt/build.sh
+
+      - name: Locate firmware
+        id: firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          firmware_path="$(find bin/targets/x86/64 -maxdepth 1 -type f -name '*squashfs-combined-efi.img.gz' -print -quit)"
+          if [ -z "$firmware_path" ]; then
+            echo "No x86-64 EFI firmware image was produced." >&2
+            exit 1
+          fi
+          echo "path=$firmware_path" >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          cat > router-info.md <<EOF
+          ## x86-64 ImmortalWrt
+
+          - 版本：$FIRMWARE_VERSION
+          - LAN 管理地址：$CUSTOM_ROUTER_IP
+          - RootFS：$ROOTFS_SIZE_CHOICE
+          - Docker：$INCLUDE_DOCKER
+          - iStore：$ENABLE_STORE
+          - PPPoE：$ENABLE_PPPOE
+          - WAN 管理访问：$ALLOW_WAN_ADMIN
+          - 用户名：root
+          - 默认密码：无，请在首次登录后立即设置
+          EOF
+
+      - name: Upload firmware release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: Autobuild-x86-64
+          name: x86-64 ImmortalWrt
+          body_path: router-info.md
+          files: ${{ steps.firmware.outputs.path }}
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload firmware for ISO build
+        if: env.OUTPUT_TYPE == 'img+iso'
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-img
+          path: ${{ steps.firmware.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build_installer_iso:
+    if: ${{ needs.build_firmware.outputs.output_type == 'img+iso' }}
+    needs: build_firmware
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v7
+        with:
+          name: firmware-img
+
+      - name: Build installer ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          firmware_file="$(find . -maxdepth 1 -type f -name '*squashfs-combined-efi.img.gz' -print -quit)"
+          if [ -z "$firmware_file" ]; then
+            echo "Firmware artifact is missing." >&2
+            exit 1
+          fi
+
+          git clone --depth=1 https://github.com/wukongdaily/img-installer.git
+          chmod +x img-installer/custom.sh img-installer/supportFiles/custom/build.sh
+          firmware_file="$(basename "$firmware_file")"
+          cd img-installer
+          bash autobuild/autobuild.sh "../$firmware_file"
+
+      - name: Upload ISO release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: Custom-Installer-x86_64-ISO
+          name: x86-64 ImmortalWrt Installer
+          body_path: img-installer/autobuild/info.md
+          files: img-installer/output/custom-installer-x86_64.iso
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
